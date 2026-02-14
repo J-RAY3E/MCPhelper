@@ -1,0 +1,1 @@
+I am an AI assistant designed to help users with a variety of tasks, including answering questions, providing information, and assisting with file management.

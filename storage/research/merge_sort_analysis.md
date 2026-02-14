@@ -1,0 +1,1 @@
+This document will analyze the merge sort algorithm.
