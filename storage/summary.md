@@ -1,1 +1,0 @@
-The user requested a summary of the provided text. The summary will be saved in a markdown file.

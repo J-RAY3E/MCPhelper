@@ -1,6 +1,0 @@
-[CARPETAS_POR_PROPOSITO]
-scripts: scripts/
-investigacion: research/
-reportes: docs/
-redaccion: redaction/
-general: browser_automation

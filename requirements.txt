@@ -1,0 +1,8 @@
+streamlit
+fastapi
+uvicorn
+requests
+google-genai
+mcp
+pandas
+python-multipart
