@@ -7,6 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from tools.system_tools import SystemTools
 from tools.navigation_tools import NavigationTools
 from tools.redaction_tools import RedactionTools
+from tools.financial_tools import FinancialTools
 
 def register_tools(mcp: FastMCP, base_path: str):
     """
@@ -16,11 +17,13 @@ def register_tools(mcp: FastMCP, base_path: str):
     system_tools_instance = SystemTools(allowed_base_path=base_path)
     navigation_tools_instance = NavigationTools()
     redaction_tools_instance = RedactionTools()
+    financial_tools_instance = FinancialTools()
 
     tool_instances = {
         "system": system_tools_instance,
         "navigation": navigation_tools_instance,
         "redaction": redaction_tools_instance,
+        "financial": financial_tools_instance,
     }
 
     for category, instance in tool_instances.items():
@@ -41,3 +44,5 @@ def register_tools(mcp: FastMCP, base_path: str):
                 mcp.tool()(sync_wrapper)
             
             sys.stderr.write(f"  Registered: {name}\n")
+    
+    return tool_instances

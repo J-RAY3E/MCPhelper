@@ -1,0 +1,562 @@
+"""
+MCPDESK Frontend - NiceGUI
+Optimized: no full re-render on keystroke. In-place updates for autocomplete.
+"""
+import asyncio
+import requests
+from nicegui import ui
+from nicegui.events import UploadEventArguments
+from typing import List, Optional
+
+BACKEND_URL = "http://localhost:8000"
+
+SLASH_COMMANDS = {
+    "/help":       "Guía de comandos y capacidades del Agente",
+    "/plot":       "Gráfico interactivo de precios",
+    "/describe":   "Estadísticas descriptivas del dataset",
+    "/info":       "Info fundamental de la acción",
+    "/indicators": "Indicadores técnicos (SMA, EMA, RSI, MACD)",
+    "/backtest":   "Backtest de estrategias de trading",
+    "/forecast":   "Predicción de precios con ML",
+    "/portfolio":  "Métricas de portfolio (Sharpe, volatilidad)",
+    "/sentiment":  "Análisis de sentimiento de noticias",
+    "/crypto":     "Datos en tiempo real de criptodivisas",
+    "/calendar":   "Calendario económico de eventos",
+    "/compare":    "Comparar múltiples acciones",
+}
+
+# ── State ──────────────────────────────────────────────────────────────────────
+
+class Cell:
+    _counter = 0
+    def __init__(self):
+        Cell._counter += 1
+        self.id      = Cell._counter
+        self.content = ""
+        self.result: Optional[dict] = None
+        self.running = False
+        self._suggestion_panel = None
+        self._textarea         = None
+        self._output_area      = None
+        self._spinner_btn      = None
+
+cells: List[Cell] = [Cell()]
+cells_container   = None
+files_panel       = None
+voice_btn         = None
+voice_status      = None
+
+# ── Voice Assistant ────────────────────────────────────────────────────────────
+
+def start_voice():
+    """Start voice recording using JavaScript"""
+    js_code = '''
+    if (!window.voiceAssistant) {
+        window.voiceAssistant = { mediaRecorder: null, audioChunks: [], stream: null, isRecording: false };
+    }
+    
+    if (window.voiceAssistant.isRecording) {
+        // Already recording
+        return;
+    }
+    
+    navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+            window.voiceAssistant.stream = stream;
+            window.voiceAssistant.audioChunks = [];
+            window.voiceAssistant.mediaRecorder = new MediaRecorder(stream);
+            window.voiceAssistant.isRecording = true;
+            
+            window.voiceAssistant.mediaRecorder.ondataavailable = event => {
+                window.voiceAssistant.audioChunks.push(event.data);
+            };
+            
+            window.voiceAssistant.mediaRecorder.onstop = () => {
+                window.voiceAssistant.isRecording = false;
+                const audioBlob = new Blob(window.voiceAssistant.audioChunks, { type: 'audio/wav' });
+                const reader = new FileReader();
+                reader.onload = function() {
+                    window.voiceAudioData = reader.result;
+                    window.voiceRecordingDone = true;
+                };
+                reader.readAsDataURL(audioBlob);
+                
+                if (window.voiceAssistant.stream) {
+                    window.voiceAssistant.stream.getTracks().forEach(track => track.stop());
+                }
+            };
+            
+            window.voiceAssistant.mediaRecorder.start();
+            if (window.voiceStatusEl) window.voiceStatusEl.textContent = '🎤 Grabando...';
+        })
+        .catch(err => {
+            console.error("Mic error:", err);
+            alert("Error accessing microphone: " + err.message);
+            window.voiceAssistant.isRecording = false;
+        });
+    '''
+    ui.run_javascript(js_code, respond=False)
+    if voice_status:
+        voice_status.set_text('🎤 Grabando...')
+
+
+def stop_voice():
+    """Stop voice recording and process"""
+    js_code = '''
+    if (window.voiceAssistant && window.voiceAssistant.mediaRecorder && window.voiceAssistant.isRecording) {
+        window.voiceAssistant.mediaRecorder.stop();
+        if (window.voiceStatusEl) window.voiceStatusEl.textContent = '⏳ Procesando...';
+    }
+    '''
+    ui.run_javascript(js_code, respond=False)
+    
+    # Schedule check for completion
+    async def process_voice():
+        await asyncio.sleep(2)
+        await check_and_send_voice()
+    
+    asyncio.create_task(process_voice())
+
+
+async def check_and_send_voice():
+    """Check recording and send to backend"""
+    js_check = '''
+    if (window.voiceRecordingDone && window.voiceAudioData) {
+        window.voiceRecordingDone = false;
+        window.voiceAudioData;
+    } else {
+        null;
+    }
+    '''
+    result = ui.run_javascript(js_check)
+    
+    if not result:
+        if voice_status:
+            voice_status.set_text('🎤 Escuchar')
+        return
+    
+    try:
+        import base64
+        import tempfile
+        import os
+        
+        # Extract and decode audio
+        audio_data = result.split(',')[1] if ',' in result else result
+        audio_bytes = base64.b64decode(audio_data)
+        
+        # Save to temp file
+        temp_dir = tempfile.gettempdir()
+        filepath = os.path.join(temp_dir, "voice_input.wav")
+        
+        with open(filepath, 'wb') as f:
+            f.write(audio_bytes)
+        
+        # Transcribe with backend
+        if voice_status:
+            voice_status.set_text('⏳ Transcribiendo...')
+        
+        with open(filepath, 'rb') as f:
+            files = {'audio': f}
+            resp = requests.post(f"{BACKEND_URL}/audio/transcribe", files=files, timeout=120)
+        
+        os.unlink(filepath)
+        
+        if resp.status_code == 200:
+            result_data = resp.json()
+            if result_data.get("success"):
+                transcription = result_data.get("text", "").strip()
+                
+                if voice_status:
+                    voice_status.set_text('⏳ Enviando...')
+                
+                # Send as command to backend
+                cmd_resp = requests.post(
+                    f"{BACKEND_URL}/command",
+                    json={"command": transcription},
+                    timeout=120
+                )
+                
+                # Add new cell with result
+                new_cell = Cell()
+                new_cell.content = transcription
+                new_cell.result = cmd_resp.json() if cmd_resp.status_code == 200 else {"type": "error", "content": cmd_resp.text}
+                cells.append(new_cell)
+                render_cells()
+                
+                if voice_status:
+                    voice_status.set_text('🎤 Escuchar')
+                
+                ui.notify("Comando enviado", type="positive", position="top-right")
+                return
+        
+        if voice_status:
+            voice_status.set_text('❌ Error')
+        ui.notify("Error en transcripción", type="negative", position="top-right")
+        
+    except Exception as e:
+        if voice_status:
+            voice_status.set_text('❌ Error')
+        ui.notify(f"Error: {str(e)}", type="negative", position="top-right")
+
+
+def toggle_voice():
+    """Toggle voice recording"""
+    js_check = '''
+    window.voiceAssistant && window.voiceAssistant.isRecording;
+    '''
+    is_recording = ui.run_javascript(js_check)
+    
+    if is_recording:
+        stop_voice()
+    else:
+        start_voice()
+
+# ── Backend ────────────────────────────────────────────────────────────────────
+
+def get_files() -> List[str]:
+    try:
+        r = requests.get(f"{BACKEND_URL}/files", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("files", [])
+    except Exception:
+        pass
+    return []
+
+async def run_cell(cell: Cell):
+    if not cell.content.strip():
+        return
+    cell.running = True
+    if cell._spinner_btn:
+        cell._spinner_btn.clear()
+        with cell._spinner_btn:
+            ui.spinner(size="xs").props("color=green")
+    if cell._output_area:
+        cell._output_area.set_visibility(False)
+        cell._output_area.clear()
+    if cell.content.strip().startswith("/help"):
+        help_text = """
+## 🤖 Guía del Asistente MCPDESK
+
+Este asistente es un **Agente Autónomo** impulsado por Inteligencia Artificial.
+
+### 📝 Comandos de Datos
+- `/plot [archivo]`: Crea gráficos interactivos.
+- `/describe [archivo]`: Estadísticas descriptivas.
+
+### 📈 Comandos Financieros
+- `/info [ticker]`: Información de la empresa.
+- `/indicators [ticker]`: Indicadores técnicos.
+- `/backtest [ticker]`: Backtest de estrategias.
+- `/forecast [ticker]`: Predicción de precios.
+- `/portfolio [tickers]`: Métricas de portfolio.
+- `/sentiment [ticker]`: Análisis de sentimiento.
+- `/crypto [moneda]`: Datos de criptomonedas.
+- `/calendar`: Calendario económico.
+- `/compare [tickers]`: Comparar acciones.
+"""
+        cell.result = {"type": "text", "content": help_text}
+    else:
+        try:
+            resp = await asyncio.to_thread(
+                requests.post,
+                f"{BACKEND_URL}/command",
+                json={"command": cell.content},
+                timeout=120,
+            )
+            cell.result = resp.json() if resp.status_code == 200 else {
+                "type": "error", "content": resp.text
+            }
+        except requests.exceptions.Timeout:
+            cell.result = {"type": "error", "content": "timeout — backend tardó demasiado"}
+        except Exception as e:
+            cell.result = {"type": "error", "content": str(e)}
+    cell.running = False
+    if cell._spinner_btn:
+        cell._spinner_btn.clear()
+        with cell._spinner_btn:
+            ui.icon("play_arrow", size="xs")
+    if cell._output_area and cell.result:
+        cell._output_area.clear()
+        with cell._output_area:
+            _render_output(cell.result)
+        cell._output_area.set_visibility(True)
+
+# ── Autocomplete ───────────────────────────────────────────────────────────────
+
+def on_input_change(e, cell: Cell):
+    cell.content = e.value
+    panel = cell._suggestion_panel
+    if panel is None:
+        return
+    words     = cell.content.split()
+    last_word = words[-1] if words else ""
+    if last_word.startswith("/") and len(last_word) >= 1:
+        matches = {k: v for k, v in SLASH_COMMANDS.items() if k.startswith(last_word)}
+        if matches:
+            _rebuild_suggestions(panel, matches, cell)
+            panel.set_visibility(True)
+            return
+    panel.set_visibility(False)
+
+def _rebuild_suggestions(panel, matches: dict, cell: Cell):
+    panel.clear()
+    with panel:
+        for cmd, desc in list(matches.items())[:8]:
+            with ui.row().classes(
+                "items-center gap-3 px-3 py-2 cursor-pointer w-full rounded"
+                " hover:bg-slate-800 transition-colors duration-100"
+            ) as row:
+                ui.label(cmd).classes("text-emerald-400 font-mono text-sm w-28 shrink-0")
+                ui.label(desc).classes("text-slate-500 text-xs truncate")
+            row.on("click", lambda _e, c=cmd, ce=cell: _insert_command(c, ce))
+
+def _insert_command(cmd: str, cell: Cell):
+    words = cell.content.split()
+    if words:
+        words[-1] = cmd
+        cell.content = " ".join(words) + " "
+    else:
+        cell.content = cmd + " "
+    if cell._textarea:
+        cell._textarea.set_value(cell.content)
+    if cell._suggestion_panel:
+        cell._suggestion_panel.set_visibility(False)
+
+import json
+
+def _render_output(result: dict):
+    rtype   = result.get("type", "text")
+    content = result.get("content", "")
+    
+    if rtype == "error":
+        ui.html(f'<pre class="text-red-400 text-xs whitespace-pre-wrap font-mono">{content}</pre>')
+    elif rtype == "mixed":
+        for item in result.get("items", []):
+            if item.get("type") == "text":
+                ui.markdown(item.get("content","")).classes("text-slate-300 text-sm markdown-body")
+            elif item.get("type") == "vega_lite":
+                chart_container = ui.element('div').classes("w-full mt-4 h-[400px]")
+                spec = item.get("spec", {})
+                spec["data"] = {"values": item.get("data", [])}
+                spec["width"] = "container"
+                spec["height"] = 300
+                spec["autosize"] = {"type": "fit", "contains": "padding"}
+                spec["background"] = "transparent"
+                spec["config"] = {
+                    "axis": {"domainColor": "#334155", "gridColor": "#1e293b", "tickColor": "#334155", "labelColor": "#94a3b8", "titleColor": "#cbd5e1"},
+                    "legend": {"labelColor": "#94a3b8", "titleColor": "#cbd5e1"},
+                    "title": {"color": "#cbd5e1"},
+                    "view": {"stroke": "transparent"}
+                }
+                spec_json = json.dumps(spec)
+                ui.run_javascript(f'''
+                    setTimeout(() => {{
+                        vegaEmbed("div[id='c{chart_container.id}']", {spec_json}, {{"actions": false, "theme": "dark"}});
+                    }}, 100);
+                ''')
+    else:
+        ui.markdown(content).classes("text-slate-300 text-sm markdown-body")
+
+# ── Cell renderer ─────────────────────────────────────────────────────────────
+
+def render_cells():
+    cells_container.clear()
+    with cells_container:
+        for idx, cell in enumerate(cells):
+            _render_cell(idx, cell)
+        ab = ui.button(on_click=add_cell).props("flat dense").classes(
+            "text-slate-700 hover:text-emerald-500 font-mono text-xs mt-2"
+        )
+        with ab:
+            ui.icon("add", size="xs")
+            ui.label("nueva celda").classes("ml-1")
+        ab.tooltip("Añadir celda")
+
+def _render_cell(idx: int, cell: Cell):
+    with ui.element("div").classes("w-full mb-4"):
+        with ui.row().classes("w-full items-start gap-2"):
+            with ui.column().classes("items-center gap-1 pt-1 w-8 shrink-0"):
+                ui.label(f"{idx:02d}").classes(
+                    "text-xs font-mono text-slate-700 select-none leading-none"
+                )
+                btn = ui.button(
+                    on_click=lambda c=cell: asyncio.create_task(run_cell(c))
+                ).props("flat dense round").classes("text-emerald-600 hover:text-emerald-300")
+                with btn:
+                    ui.icon("play_arrow", size="xs")
+                btn.tooltip("Ejecutar")
+                cell._spinner_btn = btn
+            with ui.column().classes("flex-1 gap-0"):
+                ta = ui.textarea(
+                    value=cell.content,
+                    on_change=lambda e, c=cell: on_input_change(e, c),
+                    placeholder="mensaje o /comando…",
+                ).classes("w-full font-mono text-sm text-slate-200").style(
+                    "background:transparent;"
+                    "border:none;"
+                    "border-bottom:1px solid #1e293b;"
+                    "border-radius:0;"
+                    "padding:4px 0;"
+                    "resize:none;"
+                ).props("borderless autogrow rows=1")
+                cell._textarea = ta
+                panel = ui.element("div").classes(
+                    "w-full rounded-b overflow-hidden"
+                ).style(
+                    "background:#0d1117;"
+                    "border:1px solid #1e293b;"
+                    "border-top:none;"
+                )
+                cell._suggestion_panel = panel
+                panel.set_visibility(False)
+            if len(cells) > 1:
+                db = ui.button(
+                    on_click=lambda c=cell: delete_cell(c.id)
+                ).props("flat dense round").classes(
+                    "text-slate-800 hover:text-red-500 mt-1 shrink-0"
+                )
+                with db:
+                    ui.icon("close", size="xs")
+                db.tooltip("Eliminar celda")
+        out = ui.element("div").classes(
+            "ml-10 mt-1 px-3 py-2 rounded"
+            " bg-slate-900 border-l-2 border-emerald-900 w-full"
+        )
+        cell._output_area = out
+        if cell.result:
+            with out:
+                _render_output(cell.result)
+        else:
+            out.set_visibility(False)
+
+# ── Sidebar operations ─────────────────────────────────────────────────────────
+
+def add_cell():
+    cells.append(Cell())
+    render_cells()
+
+def delete_cell(cell_id: int):
+    if len(cells) > 1:
+        cells[:] = [c for c in cells if c.id != cell_id]
+        render_cells()
+
+def refresh_files():
+    """Rebuild the file tree panel using the hierarchical /files endpoint."""
+    try:
+        r = requests.get(f"{BACKEND_URL}/files", timeout=5)
+        tree_nodes = r.json().get("tree", []) if r.status_code == 200 else []
+    except Exception:
+        tree_nodes = []
+
+    files_panel.clear()
+    with files_panel:
+        if tree_nodes:
+            ui.tree(
+                nodes=tree_nodes,
+                node_key="id",
+                label_key="label",
+                children_key="children",
+            ).classes("text-slate-400 text-xs font-mono w-full")
+        else:
+            ui.label("empty").classes("text-xs font-mono text-slate-600 italic")
+
+async def handle_upload(e: UploadEventArguments):
+    try:
+        files = {"file": (e.name, e.content.read(), "application/octet-stream")}
+        resp = await asyncio.to_thread(
+            requests.post, f"{BACKEND_URL}/upload", files=files, timeout=60
+        )
+        if resp.status_code == 200:
+            category = resp.json().get("category", "other")
+            ui.notify(f"✅ {e.name} → 📂 {category}/", type="positive", position="top-right")
+        else:
+            ui.notify(f"❌ Upload failed: {resp.text}", type="negative", position="top-right")
+        refresh_files()
+    except Exception as ex:
+        ui.notify(str(ex), type="negative", position="top-right")
+
+# ── Layout ─────────────────────────────────────────────────────────────────────
+
+ui.dark_mode(True)
+
+ui.add_head_html("""
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+<script>
+window.voiceAssistant = { isRecording: false };
+</script>
+<style>
+  body, .nicegui-content { background: #080b0f !important; }
+  textarea {
+    background: transparent !important;
+    color: #cbd5e1 !important;
+    caret-color: #10b981;
+  }
+  textarea::placeholder { color: #1e293b !important; }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: #080b0f; }
+  ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+  .markdown-body h1, .markdown-body h2, .markdown-body h3 { color: #cbd5e1 !important; margin-top: 0.5em; margin-bottom: 0.5em; border: none; padding-bottom: 0; }
+  .markdown-body p { margin-bottom: 0.5em; }
+  .markdown-body code { background-color: #1e293b !important; color: #38bdf8 !important; }
+  .markdown-body pre { background-color: #0f172a !important; border: 1px solid #1e293b; }
+</style>
+""")
+
+with ui.row().classes("w-full min-h-screen").style("background:#080b0f"):
+    with ui.column().classes("shrink-0 h-screen sticky top-0 flex flex-col").style(
+        "width:200px;background:#0d1117;border-right:1px solid #1e293b;padding:16px 12px;"
+    ):
+        ui.label("MCPDESK").classes(
+            "text-emerald-400 font-mono font-bold text-base tracking-widest mb-6"
+        )
+        
+        # Voice Assistant Button
+        ui.label("VOICE").classes(
+            "text-slate-700 font-mono text-[10px] tracking-widest uppercase mb-2"
+        )
+        voice_btn = ui.button(
+            '🎤 Escuchar',
+            on_click=toggle_voice,
+            icon='mic'
+        ).props("round color=primary").classes("w-full mb-2")
+        voice_btn.tooltip("Click para hablar")
+        voice_status = ui.label("🎤 Escuchar").classes("text-xs text-slate-600 font-mono mb-4")
+        
+        ui.separator().classes("my-3")
+        ui.label("FILES").classes(
+            "text-slate-700 font-mono text-[10px] tracking-widest uppercase mb-2"
+        )
+        files_panel = ui.column().classes("w-full mb-4 gap-0")
+        refresh_files()
+        ui.label("UPLOAD").classes(
+            "text-slate-700 font-mono text-[10px] tracking-widest uppercase mb-2"
+        )
+        upl = ui.upload(
+            on_upload=handle_upload, multiple=False
+        ).props("flat dense accept='.csv,.json,.txt,.xlsx'").classes(
+            "text-xs text-slate-600 w-full"
+        )
+        upl.tooltip("CSV · JSON · TXT · XLSX")
+        ui.space()
+        ui.label("v0.4 · local").classes("text-slate-800 font-mono text-[10px]")
+
+    with ui.column().classes("flex-1 overflow-y-auto").style("padding:24px 32px"):
+        with ui.row().classes("items-baseline gap-3 mb-6"):
+            ui.label("notebook").classes(
+                "text-slate-200 font-mono font-bold text-2xl"
+            )
+            ui.label("/ session").classes("text-slate-700 font-mono text-sm")
+        cells_container = ui.column().classes("w-full max-w-3xl gap-0")
+        render_cells()
+
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(
+        title="MCPDESK",
+        port=8501,
+        reload=False,
+        show=True,
+        dark=True,
+        favicon="◈",
+    )

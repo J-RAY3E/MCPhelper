@@ -1,14 +1,10 @@
 import os
 import sys
-import asyncio
 import threading
 import uvicorn
-import pandas as pd
-import io
-import json
+import inspect
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from typing import List, Optional, Any, Dict
 
 # Add current directory to sys.path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,142 +17,191 @@ if project_root not in sys.path:
 
 from utils.llm_client import get_client
 from core.planner import LLMPlanner
+from core.validator import LLMPlanValidator
+from core.executor import ToolExecutor
+from core.summarizer import LLMSummarizer
+from core.data_analyst import DataAnalyst
+from core.agent_orchestrator import AgentOrchestrator
 from tool_registry import register_tools
 from mcp.server.fastmcp import FastMCP
 
-app = FastAPI(title="MCP Helper Backend")
+# Import audio routes
+from audio_routes import router as audio_router
+
+app = FastAPI(title="MCPDESK Backend")
+
+# Include audio routes
+app.include_router(audio_router)
 
 # Initialize core components
 llm = get_client()
 planner = LLMPlanner(llm)
-mcp = FastMCP("MCP-Helper")
+validator = LLMPlanValidator(llm)
+summarizer = LLMSummarizer(llm)
+
+mcp = FastMCP("MCPDESK")
 workspace_path = project_root
-register_tools(mcp, workspace_path)
+tool_instances = register_tools(mcp, workspace_path)
+executor = ToolExecutor(tool_instances)
 
 # Ensure storage exists
 STORAGE_DIR = os.path.join(workspace_path, "storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
+
+# Initialize modular handlers
+data_analyst = DataAnalyst(llm, STORAGE_DIR)
+
+def get_tool_descriptions():
+    """Build a text description of all registered tools."""
+    descriptions = []
+    for category, instance in tool_instances.items():
+        for name, method in inspect.getmembers(instance, inspect.ismethod):
+            if hasattr(method, '_is_tool') and method._is_tool:
+                doc = inspect.getdoc(method) or "No description"
+                sig = inspect.signature(method)
+                params = str(sig)
+                descriptions.append(f"- {name}{params}: {doc}")
+    return "\n".join(descriptions)
+
+orchestrator = AgentOrchestrator(llm, planner, executor, summarizer, get_tool_descriptions)
 
 class CommandRequest(BaseModel):
     command: str
 
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "MCP Helper Backend is running"}
+    return {"status": "online", "name": "MCPDESK Backend"}
+
+# ── File Upload with AI Classifier ─────────────────────────────────────────────
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload a file to the storage directory."""
-    file_path = os.path.join(STORAGE_DIR, file.filename)
+    """
+    Upload a file to storage.
+    The LLM classifies the file by name/extension and saves it into the
+    appropriate subfolder (datasets/, finance/, documents/, reports/, other/).
+    """
+    contents = await file.read()
+    filename = file.filename
+
+    # AI-based file classification
+    classification_prompt = (
+        f"You are a file librarian. Classify this file into ONE of these categories: "
+        f"'datasets', 'finance', 'documents', 'reports', 'other'. "
+        f"Respond ONLY with that single category word — nothing else. File name: '{filename}'"
+    )
+    try:
+        category = llm.chat([{"role": "user", "content": classification_prompt}])
+        allowed = {"datasets", "finance", "documents", "reports", "other"}
+        category = category.strip().lower().split()[0]
+        if category not in allowed:
+            category = "other"
+    except Exception:
+        category = "other"
+
+    dest_dir = os.path.join(STORAGE_DIR, category)
+    os.makedirs(dest_dir, exist_ok=True)
+    file_path = os.path.join(dest_dir, filename)
     try:
         with open(file_path, "wb") as f:
-            f.write(await file.read())
-        return {"status": "success", "filename": file.filename}
+            f.write(contents)
+        return {
+            "status": "success",
+            "filename": filename,
+            "category": category,
+            "path": os.path.relpath(file_path, STORAGE_DIR),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Hierarchical File Tree ──────────────────────────────────────────────────────
+
+def _build_tree(directory: str, rel_base: str = "") -> list:
+    """
+    Recursively scan `directory` and return a list of nodes compatible with
+    NiceGUI's ui.tree format: [{"id": ..., "label": ..., "children": [...]}, ...]
+    Hidden directories (starting with '.') such as .cache are excluded.
+    """
+    nodes = []
+    try:
+        entries = sorted(
+            os.scandir(directory),
+            key=lambda e: (not e.is_dir(), e.name.lower())
+        )
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue  # Skip .cache and other hidden dirs
+            rel_path = os.path.join(rel_base, entry.name) if rel_base else entry.name
+            if entry.is_dir():
+                children = _build_tree(entry.path, rel_path)
+                nodes.append({"id": rel_path, "label": entry.name, "children": children})
+            else:
+                nodes.append({"id": rel_path, "label": entry.name})
+    except PermissionError:
+        pass
+    return nodes
+
+
+@app.get("/files")
+async def list_files():
+    """Return a hierarchical file tree of storage/ (NiceGUI ui.tree compatible)."""
+    tree = _build_tree(STORAGE_DIR)
+    return {"tree": tree}
+
+
+# ── Main Command Handler ────────────────────────────────────────────────────────
+
 @app.post("/command")
 async def handle_command(request: CommandRequest):
-    """Handle commands from the frontend."""
+    """
+    Handle commands from the frontend dynamically.
+    Delegates strictly to modular components.
+    """
     cmd = request.command.strip()
-    
+
     try:
-        if cmd.startswith("/describe"):
-            # Format: /describe [filename.csv]
-            parts = cmd.split()
-            filename = parts[1] if len(parts) > 1 else None
-            
-            if not filename:
-                # Try to find the latest CSV in storage
-                csv_files = [f for f in os.listdir(STORAGE_DIR) if f.endswith(".csv")]
-                if not csv_files:
-                    return {"type": "text", "content": "Error: No hay archivos CSV en storage."}
-                filename = csv_files[0]
-            
-            file_path = os.path.join(STORAGE_DIR, filename)
-            if not os.path.exists(file_path):
-                return {"type": "text", "content": f"Error: El archivo {filename} no existe."}
-            
-            df = pd.read_csv(file_path)
-            description = df.describe().reset_index().to_json(orient="records")
-            
-            return {
-                "type": "mixed",
-                "items": [
-                    {"type": "text", "content": f"### Estadísticas de `{filename}`\nAquí tienes el resumen descriptivo del dataset:"},
-                    {"type": "table", "content": description}
-                ]
-            }
+        # 1. IMMEDIATE ANALYTICAL CHECK (plain text, no slash)
+        if not cmd.startswith("/") and len(cmd.split()) > 2:
+            system_msg = "You are a Global Senior Intelligence Analyst. INTERPRET data, look for 'the why', and respond in professional Markdown."
+            result = llm.chat([{"role": "system", "content": system_msg}, {"role": "user", "content": cmd}])
+            return {"type": "text", "content": result, "mode": getattr(llm, "mode", "unknown")}
 
-        elif cmd.startswith("/plot"):
-            # Format: /plot line from [filename.csv]
-            # Simple implementation for MVP
-            csv_files = [f for f in os.listdir(STORAGE_DIR) if f.endswith(".csv")]
-            if not csv_files:
-                return {"type": "text", "content": "Error: No hay archivos CSV para graficar."}
-            
-            filename = csv_files[0] # Take first for simplicity
-            file_path = os.path.join(STORAGE_DIR, filename)
-            df = pd.read_csv(file_path)
-            
-            # Use numeric columns for charting
-            numeric_df = df.select_dtypes(include=['number'])
-            if numeric_df.empty:
-                return {"type": "text", "content": "Error: No hay columnas numéricas para graficar."}
-            
-            chart_data = numeric_df.to_json(orient="records")
-            
-            return {
-                "type": "mixed",
-                "items": [
-                    {"type": "text", "content": f"### Gráfico de `{filename}`\nVisualizando columnas numéricas:"},
-                    {"type": "chart", "content": chart_data}
-                ]
-            }
+        # 2. DATA ANALYST (Pandas, Vega-Lite JSON logic)
+        if cmd.startswith("/plot") or cmd.startswith("/describe"):
+            return data_analyst.handle_data_command(cmd)
 
-        else:
-            # Enhanced LLM prompt for Markdown/LaTeX
-            system_msg = (
-                "You are an expert market analyst. "
-                "Always respond using Markdown. "
-                "When expressing formulas, statistics, or complex symbols, use LaTeX (e.g., $E=mc^2$ or $\mu = \\frac{\sum X}{N}$). "
-                "Be concise and professional."
-            )
-            result = llm.chat([
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": cmd}
-            ])
-            return {"type": "text", "content": result}
-            
+        # 3. AUTONOMOUS AGENT ORCHESTRATION (Planner -> Executor -> Summarizer)
+        return await orchestrator.execute_query(cmd)
+
     except Exception as e:
-        return {"type": "text", "content": f"**Error:** {str(e)}"}
+        return {"type": "text", "content": f"**System Route Error:** {str(e)}"}
+
+
+# ── Console & Server Bootstrap ──────────────────────────────────────────────────
 
 def run_console():
-    """Interactive console for local testing."""
-    print("--- MCP Helper Console Mode ---")
-    print("Type 'exit' to quit.")
+    """Interactive console."""
+    print("--- MCPDESK Console ---")
     while True:
         try:
-            user_input = input("MCP> ")
-            if user_input.lower() in ["salir", "exit", "quit"]:
+            user_input = input("MCPDESK> ")
+            if user_input.lower() in ["exit", "quit"]:
                 break
-            
-            # Simplified for console
-            response = llm.chat([{"role": "user", "content": user_input}])
-            print(f"[{llm.mode.upper()}] Response: {response}")
+            import asyncio
+            response = asyncio.run(orchestrator.execute_query(user_input))
+            print(f"[{llm.mode.upper()}]\n{response.get('content')}")
         except EOFError:
             break
         except Exception as e:
             print(f"Error: {e}")
 
+
 def start_api():
-    """Run the FastAPI server."""
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
 if __name__ == "__main__":
-    # Start API in a background thread
     api_thread = threading.Thread(target=start_api, daemon=True)
     api_thread.start()
-    
-    # Run console in main thread
     run_console()

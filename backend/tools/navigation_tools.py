@@ -158,29 +158,35 @@ class NavigationTools:
         Gets REAL stock market data (prices, volume) for any company.
         Returns CSV-formatted data with Date, Open, High, Low, Close, Volume.
         Use this for stock prices, market data, financial history.
-        :param ticker: Stock ticker symbol (e.g. "GOOG", "AAPL", "MSFT", "TSLA")
+        :param ticker: Stock ticker symbol (e.g. "GOOG", "AAPL", "MSFT", "TSLA", "KO")
         :param period: Time period - "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"
         """
         try:
+            ticker = ticker.strip().upper()
             stock = yf.Ticker(ticker)
             df = stock.history(period=period)
             
             if df.empty:
-                return f"No data found for ticker '{ticker}'. Verify the symbol is correct."
+                return f"No data found for ticker '{ticker}'. Verify the symbol is correct (e.g., 'KO' for Coca-Cola, 'AAPL' for Apple)."
             
             # Format as CSV text
             csv_text = "Date,Open,High,Low,Close,Volume\n"
-            for date, row in df.iterrows():
+            # Limit rows if too many for the LLM context (e.g., last 30 days of data if > 30)
+            rows_to_show = df.tail(60) if len(df) > 60 else df
+            
+            for date, row in rows_to_show.iterrows():
                 csv_text += f"{date.strftime('%Y-%m-%d')},{row['Open']:.2f},{row['High']:.2f},{row['Low']:.2f},{row['Close']:.2f},{int(row['Volume'])}\n"
             
-            info = stock.info
-            name = info.get('longName', ticker)
+            try:
+                name = stock.info.get('longName', ticker)
+            except:
+                name = ticker
             
             result = f"## Stock Data: {name} ({ticker})\n"
-            result += f"Period: {period} | Records: {len(df)}\n"
+            result += f"Period: {period} | Records shown: {len(rows_to_show)} (out of {len(df)})\n"
             result += f"Current Price: ${df['Close'].iloc[-1]:.2f}\n"
-            result += f"52w High: ${df['High'].max():.2f} | 52w Low: ${df['Low'].min():.2f}\n\n"
-            result += f"### CSV DATA:\n{csv_text}"
+            result += f"Period High: ${df['High'].max():.2f} | Period Low: ${df['Low'].min():.2f}\n\n"
+            result += f"### CSV DATA (Tail):\n{csv_text}"
             
             return result
         except Exception as e:

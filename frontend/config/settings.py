@@ -1,0 +1,2 @@
+BACKEND_URL = "http://localhost:8000"
+FRONTEND_PORT = 8501

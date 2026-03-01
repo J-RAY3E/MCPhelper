@@ -1,55 +1,35 @@
-"""LLM-based Summarizer implementation."""
+"""Professional LLM Summarizer implementation."""
 from typing import List
-
 from core.interfaces import BaseSummarizer
 
-
 class LLMSummarizer(BaseSummarizer):
-    """Uses an LLM to generate final responses."""
+    """Refined summarizer for high-quality, professional reports."""
     
     def __init__(self, llm_client):
-        """
-        Args:
-            llm_client: LLMClient instance (supports .chat() method)
-        """
         self.llm = llm_client
     
     async def summarize(self, task: str, results: List[str]) -> str:
-        """Create a user-facing summary from execution results."""
+        """Create a professional market intelligence summary."""
         
-        # Filter out error-only results
         valid_results = [r for r in results if not r.startswith("Error executing")]
-        
         if not valid_results:
-            return "No se pudieron obtener resultados. Por favor intenta de nuevo."
+            return "Unable to process the request due to missing tool data. Please try a more specific topic."
         
-        results_text = chr(10).join(
-            f'--- Result {i+1} ---\n{r[:2000]}' for i, r in enumerate(valid_results)
-        )
-        
-        summary_prompt = f"""USER QUESTION: {task}
-
-TOOL RESULTS (this data is REAL, already fetched from the internet/APIs):
-{results_text}
-
-Using ONLY the data above, write a clear and helpful answer for the user.
-Do NOT add disclaimers about not being able to access real-time data.
-The data above IS real-time data, already fetched by tools on your behalf."""
+        results_text = chr(10).join(f'--- Tool Result {i+1} ---\n{r}' for i, r in enumerate(valid_results))
         
         system_msg = (
-            "You are a helpful assistant. You have been given REAL DATA that was already "
-            "fetched from the internet by automated tools. This data is REAL and CURRENT. "
-            "Your job is to summarize it clearly for the user. "
-            "FORBIDDEN PHRASES (never use these): "
-            "'I cannot access real-time data', "
-            "'I cannot browse the internet', "
-            "'As an AI language model', "
-            "'I don't have access to'. "
-            "The data is ALREADY PROVIDED TO YOU. Use it."
+            "You are a Senior Intelligence Analyst. You have been provided with REAL-TIME DATA "
+            "already fetched from the internet. Your job is to deliver a professional report. "
+            "\n\nSTYLE RULES:\n"
+            "1. USE LaTeX for ALL mathematical notation and statistics (e.g. use $\\mu$, $\\sigma$, $E=mc^2$).\n"
+            "2. Wrap LaTeX blocks in double dollar signs $$ ... $$ for clarity.\n"
+            "3. Use professional, clean Markdown with clear headers and bullet points.\n"
+            "4. NEVER use filler phrases like 'As an AI language model' or 'I don't have access to live data'.\n"
+            "5. The data provided is REAL. Trust it and summarize it elegantly."
         )
         
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": summary_prompt}
+            {"role": "user", "content": f"USER INQUIRY: {task}\n\nRAW DATA GATHERED:\n{results_text}"}
         ]
-        return self.llm.chat(messages, temperature=0.5)
+        return self.llm.chat(messages, temperature=0.3)
